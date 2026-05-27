@@ -3,20 +3,22 @@ import json
 import joblib
 import pandas as pd
 import warnings
-import os
 warnings.filterwarnings('ignore')
 
 print("--- MEMUAT SISTEM PERTAHANAN AI ---")
-model = joblib.load('model_knn_ddos.pkl')
-scaler = joblib.load('scaler_ddos.pkl')
+# Memuat 6 komponen utama dari Colab
+model        = joblib.load('model_knn_ddos.pkl')
+scaler       = joblib.load('scaler_ddos.pkl')
+selector     = joblib.load('selector_ddos.pkl')
 feature_cols = joblib.load('feature_columns.pkl')
+kolom_hapus  = joblib.load('kolom_hapus_korelasi.pkl')
+kolom_nocorr = joblib.load('kolom_nocorr.pkl')
 
 IP = "127.0.0.1"
 PORT = 9999
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 server.bind((IP, PORT))
 
-# Penyimpanan memori server
 blacklist_ips = set()
 log_serangan = []
 statistik = {'total_terima': 0, 'tebakan_benar': 0, 'tebakan_salah': 0}
@@ -29,44 +31,65 @@ try:
         data, addr = server.recvfrom(8192)
         paket = json.loads(data.decode('utf-8'))
         
-        # Ekstraksi IP dan Kunci Jawaban (jika ada) sebelum masuk ke AI
+        # Ekstraksi IP dan Kunci Jawaban
         ip_pengirim = paket.pop('src', addr[0])
         label_asli = paket.pop('label_asli', None) 
         
-        # 1. CEK FIREWALL LEVEL KERNEL (Blacklist)
+        # 1. CEK FIREWALL KERNEL (Blacklist)
         if ip_pengirim in blacklist_ips:
             print(f"🚫 [DROP] Paket dibuang dari IP Blacklist: {ip_pengirim}")
             continue
             
         statistik['total_terima'] += 1
 
-        # 2. PREPROCESSING UNTUK AI
+        # ========================================================
+        # 2. PIPELINE PREPROCESSING AI (Sesuai Standar Colab Baru)
+        # ========================================================
         df_paket = pd.DataFrame([paket])
+        
+        # A. One-Hot Encoding (Jika format Protocol berupa teks)
+        if 'Protocol' in df_paket.columns:
+            df_paket = pd.get_dummies(df_paket, columns=['Protocol'])
+            
+        # B. Reindex ke feature_columns (Persiapan masuk Scaler)
         for col in feature_cols:
             if col not in df_paket.columns:
                 df_paket[col] = 0
         df_paket = df_paket[feature_cols]
 
-        # 3. PREDIKSI AI
+        # C. Feature Scaling
         data_scaled = scaler.transform(df_paket)
-        prediksi = int(model.predict(data_scaled)[0])
+        df_scaled = pd.DataFrame(data_scaled, columns=feature_cols)
 
-        # 4. EVALUASI AKURASI (Jika dikirim dari Mode 3 dataset)
+        # D. Buang Kolom Korelasi Tinggi
+        df_nocorr = df_scaled.drop(columns=[c for c in kolom_hapus if c in df_scaled.columns], errors='ignore')
+
+        # E. Reindex ke kolom_nocorr (Persiapan masuk Selector)
+        for col in kolom_nocorr:
+            if col not in df_nocorr.columns:
+                df_nocorr[col] = 0
+        df_nocorr = df_nocorr[kolom_nocorr]
+
+        # F. SelectKBest (Pilih fitur penting)
+        data_selected = selector.transform(df_nocorr)
+
+        # G. PREDIKSI AKHIR KNN
+        prediksi = int(model.predict(data_selected)[0])
+        # ========================================================
+
+        # Evaluasi Kunci Jawaban (Mode 3 CSV)
         if label_asli is not None:
             if prediksi == int(label_asli):
                 statistik['tebakan_benar'] += 1
             else:
                 statistik['tebakan_salah'] += 1
 
-        # 5. TINDAKAN (MITIGASI LINUX)
+        # 3. TINDAKAN (MITIGASI LINUX)
         if prediksi == 1:
             print(f"⚠️ [BAHAYA] DDoS Terdeteksi dari {ip_pengirim}!")
-            
-            # Simulasi menjalankan perintah Linux Firewall
             perintah_iptables = f"sudo iptables -A INPUT -s {ip_pengirim} -j DROP"
             print(f"🔒 Mengeksekusi kernel: {perintah_iptables}")
             
-            # Menyimpan ke memori
             blacklist_ips.add(ip_pengirim)
             log_serangan.append(ip_pengirim)
             print(f"✅ Mitigasi berhasil. IP {ip_pengirim} diblokir permanen.\n")
@@ -74,7 +97,6 @@ try:
             print(f"✅ [AMAN] Traffic dari {ip_pengirim} diizinkan.")
 
 except KeyboardInterrupt:
-    # 6. CETAK RAPOR SAAT SERVER DIMATIKAN
     print("\n\n===============================================")
     print("📊 LAPORAN EVALUASI INTRUSION PREVENTION SYSTEM")
     print("===============================================")
@@ -90,7 +112,7 @@ except KeyboardInterrupt:
 
     print("\n📜 DAFTAR IP PENYERANG YANG DIBLOKIR (BLACKLIST):")
     if len(blacklist_ips) > 0:
-        for idx, ip in enumerate(list(blacklist_ips)[:10], 1): # Tampilkan maks 10 IP
+        for idx, ip in enumerate(list(blacklist_ips)[:10], 1):
             print(f"   {idx}. {ip}")
         if len(blacklist_ips) > 10:
             print(f"   ... dan {len(blacklist_ips) - 10} IP lainnya.")
